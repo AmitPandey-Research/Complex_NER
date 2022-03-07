@@ -1,0 +1,5 @@
+transformers
+torch
+pytorch-crf
+nltk==3.4.5
+spacy==2.2.3
