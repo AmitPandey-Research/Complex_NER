@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-__author__ = 'Dhanachandra N.'
+__author__ = 'Amit_Swayatta'
 
 #from __future__ import unicode_literals, print_function, division
 from io import open
@@ -141,7 +141,8 @@ class Bert_CRF(BertPreTrainedModel):
         self.num_labels = config.num_labels
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
+        self.classifier = nn.Linear(512*2, config.num_labels)
+        self.lstm = nn.LSTM(768, 512 , batch_first=True,bidirectional=True)
         self.init_weights()
         self.crf = CRF(self.num_labels, batch_first=True)    
     
@@ -149,6 +150,8 @@ class Bert_CRF(BertPreTrainedModel):
         outputs = self.bert(input_ids, attn_masks)
         sequence_output = outputs[0]
         sequence_output = self.dropout(sequence_output)
+        sequence_output = self.lstm(sequence_output)
+        sequence_output = self.dropout(sequence_output[0])
         emission = self.classifier(sequence_output)        
         attn_masks = attn_masks.type(torch.uint8)
         if labels is not None:

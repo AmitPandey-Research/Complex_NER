@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-__author__ = 'Dhanachandra N.'
+__author__ = 'Amit_Swayatta'
 
 #from __future__ import unicode_literals, print_function, division
 from io import open
@@ -18,7 +18,7 @@ from transformers import BertTokenizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import numpy as np
 import os
-from transformers import BertPreTrainedModel, BertModel, BertForTokenClassification
+from transformers import BertPreTrainedModel, BertModel
 from torchcrf import CRF
 import timeit
 import subprocess
@@ -48,6 +48,7 @@ seed_torch()
 from collections import OrderedDict
 # read the corpus and return them into list of sentences of list of tokens
 def corpus_reader(path, delim='\t', word_idx=0, label_idx=-1):
+    print(path)
     tokens, labels = [], []
     tmp_tok, tmp_lab = [], []
     label_set = []
@@ -55,11 +56,16 @@ def corpus_reader(path, delim='\t', word_idx=0, label_idx=-1):
         for line in reader:
             line = line.strip()
             cols = line.split(delim)
-            if len(cols) < 2:
-                if len(tmp_tok) > 0:
-                    tokens.append(tmp_tok); labels.append(tmp_lab)
-                tmp_tok = []
-                tmp_lab = []
+            if len(cols[label_idx])>=10:
+              continue
+            if len(cols)<2 and cols[0] == '' :
+              if len(tmp_tok) > 0 and len(tmp_tok)<110:
+                  tokens.append(tmp_tok); labels.append(tmp_lab)
+              tmp_tok = []
+              tmp_lab = []
+            elif len(cols)<2:
+              continue
+
             else:
                 tmp_tok.append(cols[word_idx])
                 tmp_lab.append(cols[label_idx])
@@ -111,31 +117,56 @@ def pad(batch):
     get_element = lambda x: [sample[x] for sample in batch]
     seq_len = get_element(1)
     maxlen = np.array(seq_len).max()
-    do_pad = lambda x, seqlen: [sample[x] + [0] * (seqlen - len(sample[x])) for sample in batch] # 0: <pad>
+    # print("Maxlength = ",maxlen)
+    # maxlen = 128
+    do_pad = lambda x, seqlen: [sample[x][:maxlen] + [0] * (seqlen - len(sample[x])) for sample in batch] # 0: <pad>
     tok_ids = do_pad(0, maxlen)
     attn_mask = [[(i>0) for i in ids] for ids in tok_ids] 
     LT = torch.LongTensor
     label = do_pad(3, maxlen)
-
     # sort the index, attn mask and labels on token length
     token_ids = get_element(0)
     token_ids_len = torch.LongTensor(list(map(len, token_ids)))
     _, sorted_idx = token_ids_len.sort(0, descending=True)
-
     tok_ids = LT(tok_ids)[sorted_idx]
     attn_mask = LT(attn_mask)[sorted_idx]
     labels = LT(label)[sorted_idx]
     org_tok_map = get_element(2)
     sents = get_element(-1)
-
     return tok_ids, attn_mask, org_tok_map, labels, sents, list(sorted_idx.cpu().numpy())
+
+class Bert_CRF(BertPreTrainedModel):
+    def __init__(self, config):
+        super(Bert_CRF, self).__init__(config)
+        self.num_labels = config.num_labels
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(512*2, config.num_labels)
+        self.lstm = nn.LSTM(768, 512 , batch_first=True,bidirectional=True)
+        self.init_weights()
+        self.crf = CRF(self.num_labels, batch_first=True)    
+    
+    def forward(self, input_ids, attn_masks, labels=None):  # dont confuse this with _forward_alg above.
+        outputs = self.bert(input_ids, attn_masks)
+        sequence_output = outputs[0]
+        sequence_output = self.dropout(sequence_output)
+        sequence_output = self.lstm(sequence_output)
+        sequence_output = self.dropout(sequence_output[0])
+        emission = self.classifier(sequence_output)        
+        attn_masks = attn_masks.type(torch.uint8)
+        if labels is not None:
+            loss = -self.crf(log_soft(emission, 2), labels, mask=attn_masks, reduction='mean')
+            return loss
+        else:
+            prediction = self.crf.decode(emission, mask=attn_masks)
+            return prediction
 
 def generate_training_data(config, bert_tokenizer="bert-base", do_lower_case=True):
     training_data, validation_data = config.data_dir+config.training_data, config.data_dir+config.val_data 
     train_sentences, train_labels, label_set = corpus_reader(training_data, delim=' ')
     label_set.append('X')
     tag2idx = {t:i for i, t in enumerate(label_set)}
-    #print('Training datas: ', len(train_sentences))
+    print('Training datas: ', len(train_sentences))
     train_dataset = NER_Dataset(tag2idx, train_sentences, train_labels, tokenizer_path = bert_tokenizer, do_lower_case=do_lower_case)
     # save the tag2indx dictionary. Will be used while prediction
     with open(config.apr_dir + 'tag2idx.pkl', 'wb') as f:
@@ -143,7 +174,6 @@ def generate_training_data(config, bert_tokenizer="bert-base", do_lower_case=Tru
     dev_sentences, dev_labels, _ = corpus_reader(validation_data, delim=' ')
     dev_dataset = NER_Dataset(tag2idx, dev_sentences, dev_labels, tokenizer_path = bert_tokenizer, do_lower_case=do_lower_case)
 
-    #print(len(train_dataset))
     train_iter = data.DataLoader(dataset=train_dataset,
                                 batch_size=config.batch_size,
                                 shuffle=True,
@@ -168,16 +198,15 @@ def generate_test_data(config, tag2idx, bert_tokenizer="bert-base", do_lower_cas
     return test_iter
 
 def train(train_iter, eval_iter, tag2idx, config, bert_model="bert-base-uncased"):
-    #print('#Tags: ', len(tag2idx))
+    # print('#Tags: ', len(tag2idx))
     unique_labels = list(tag2idx.keys())
-    #model = Bert_CRF.from_pretrained(bert_model, num_labels = len(tag2idx))
-    model = BertForTokenClassification.from_pretrained(bert_model, num_labels=len(tag2idx))
+    model = Bert_CRF.from_pretrained(bert_model, num_labels = len(tag2idx))
     model.train()
     if torch.cuda.is_available():
       model.cuda()
     num_epoch = config.epoch
     gradient_acc_steps = 1
-    t_total = len(train_iter) // gradient_acc_steps * num_epoch
+    t_total = len(train_iter) // gradient_acc_steps * num_epoch 
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {
@@ -206,10 +235,10 @@ def train(train_iter, eval_iter, tag2idx, config, bert_model="bert-base-uncased"
             token_ids, attn_mask, _, labels, _, _= batch
             #print(labels)
             inputs = {'input_ids' : token_ids.to(device),
-                     'attention_mask' : attn_mask.to(device),
+                     'attn_masks' : attn_mask.to(device),
                      'labels' : labels.to(device)
                      }  
-            loss= model(**inputs)[0] 
+            loss= model(**inputs) 
             loss.backward()
             tmp_loss += loss.item()
             tr_loss += loss.item()
@@ -229,48 +258,45 @@ def train(train_iter, eval_iter, tag2idx, config, bert_model="bert-base-uncased"
         #'''
         #Y_pred = []
         #Y_true = []
-        val_loss = 0.0
-        model.eval()
-        writer = open(config.apr_dir + 'prediction_'+str(epoch)+'.csv', 'w')
-        for i, batch in enumerate(eval_iter):
-            token_ids, attn_mask, org_tok_map, labels, original_token, sorted_idx = batch
-            #attn_mask.dt
-            inputs = {'input_ids': token_ids.to(device),
-                      'attention_mask' : attn_mask.to(device),
-                      'labels' : labels.to(device)
-                     }  
+        # val_loss = 0.0
+        # model.eval()
+        # writer = open(config.apr_dir + 'prediction_'+str(epoch)+'.csv', 'w')
+        # for i, batch in enumerate(eval_iter):
+        #     token_ids, attn_mask, org_tok_map, labels, original_token, sorted_idx = batch
+        #     #attn_mask.dt
+        #     inputs = {'input_ids': token_ids.to(device),
+        #               'attn_masks' : attn_mask.to(device)
+        #              }  
             
-            # dev_inputs = {'input_ids' : token_ids.to(device),
-            #              'attn_masks' : attn_mask.to(device),
-            #              'labels' : labels.to(device)
-            #              } 
-            with torch.torch.no_grad():
-                outputs = model(**inputs)
-            val_loss += outputs[0].item()
-            logits = outputs[1].detach().cpu().numpy()
-            tag_seqs = [list(p) for p in np.argmax(logits, axis=2)]
-            #print(labels.numpy())
-            #print(type(tag_seqs), tag_seqs[0][0])
-            y_true = list(labels.cpu().numpy())
-            for i in range(len(sorted_idx)):
-                o2m = org_tok_map[i]
-                pos = sorted_idx.index(i)
-                for j, orig_tok_idx in enumerate(o2m):
-                    writer.write(original_token[i][j] + '\t')
-                    writer.write(unique_labels[y_true[pos][orig_tok_idx]] + '\t')
-                    pred_tag = unique_labels[tag_seqs[pos][orig_tok_idx]]
-                    if pred_tag == 'X':
-                        pred_tag = 'O'
-                    writer.write(pred_tag + '\n')
-                writer.write('\n')
+        #     dev_inputs = {'input_ids' : token_ids.to(device),
+        #                  'attn_masks' : attn_mask.to(device),
+        #                  'labels' : labels.to(device)
+        #                  } 
+        #     with torch.torch.no_grad():
+        #         tag_seqs = model(**inputs)
+        #         tmp_eval_loss = model(**dev_inputs)
+        #     val_loss += tmp_eval_loss.item()
+        #     #print(labels.numpy())
+        #     y_true = list(labels.cpu().numpy())
+        #     for i in range(len(sorted_idx)):
+        #         o2m = org_tok_map[i]
+        #         pos = sorted_idx.index(i)
+        #         for j, orig_tok_idx in enumerate(o2m):
+        #             writer.write(original_token[i][j] + '\t')
+        #             writer.write(unique_labels[y_true[pos][orig_tok_idx]] + '\t')
+        #             pred_tag = unique_labels[tag_seqs[pos][orig_tok_idx]]
+        #             if pred_tag == 'X':
+        #                 pred_tag = 'O'
+        #             writer.write(pred_tag + '\n')
+        #         writer.write('\n')
                 
-        validation_loss.append(val_loss/len(eval_iter))
-        writer.flush()
-        print('Epoch: ', epoch)
-        command = "python conlleval.py < " + config.apr_dir + "prediction_"+str(epoch)+".csv"
-        process = subprocess.Popen(command,stdout=subprocess.PIPE, shell=True)
-        result = process.communicate()[0].decode("utf-8")
-        print(result)
+        # validation_loss.append(val_loss/len(eval_iter))
+        # writer.flush()
+        # print('Epoch: ', epoch)
+        # command = "python conlleval.py < " + config.apr_dir + "prediction_"+str(epoch)+".csv"
+        # process = subprocess.Popen(command,stdout=subprocess.PIPE, shell=True)
+        # result = process.communicate()[0].decode("utf-8")
+        # print(result)
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -292,14 +318,11 @@ def test(config, test_iter, model, unique_labels, test_output):
         token_ids, attn_mask, org_tok_map, labels, original_token, sorted_idx = batch
         #attn_mask.dt
         inputs = {'input_ids': token_ids.to(device),
-                  'attention_mask' : attn_mask.to(device),
-                  'labels' : labels.to(device)
+                  'attn_masks' : attn_mask.to(device)
                  }  
         with torch.torch.no_grad():
-            outputs = model(**inputs)
+            tag_seqs = model(**inputs)
         y_true = list(labels.cpu().numpy())
-        logits = outputs[1].detach().cpu().numpy()
-        tag_seqs = [list(p) for p in np.argmax(logits, axis=2)]
         for i in range(len(sorted_idx)):
             o2m = org_tok_map[i]
             pos = sorted_idx.index(i)
@@ -322,13 +345,11 @@ def parse_raw_data(padded_raw_data, model, unique_labels, out_file_name='raw_pre
     #attn_mask.dt
     writer = open(out_file_name, 'w')
     inputs = {'input_ids': token_ids.to(device),
-              'attention_mask' : attn_mask.to(device),
-              'labels' : labels.to(device)
-              }  
+              'attn_masks' : attn_mask.to(device)
+             }  
     with torch.torch.no_grad():
-        outputs = model(**inputs)
+        tag_seqs = model(**inputs)
     y_true = list(labels.cpu().numpy())
-    logits = outputs[1].detach().cpu().numpy()
     for i in range(len(sorted_idx)):
         o2m = org_tok_map[i]
         pos = sorted_idx.index(i)
@@ -356,7 +377,7 @@ def load_model(config, do_lower_case=True):
     f = open(config.apr_dir +'tag2idx.pkl', 'rb')
     tag2idx = pickle.load(f)
     unique_labels = list(tag2idx.keys())
-    model = BertForTokenClassification.from_pretrained(config.bert_model, num_labels=len(tag2idx))
+    model = Bert_CRF.from_pretrained(config.bert_model, num_labels=len(tag2idx))
     checkpoint = torch.load(config.apr_dir + config.model_name, map_location='cpu')
     model.load_state_dict(checkpoint['model_state_dict'])
     global bert_tokenizer
